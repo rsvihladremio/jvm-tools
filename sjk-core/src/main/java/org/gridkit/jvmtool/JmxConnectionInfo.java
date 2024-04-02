@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.Socket;
 import java.rmi.NotBoundException;
+import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.ObjID;
@@ -32,6 +33,8 @@ import javax.management.MBeanServerConnection;
 import javax.management.remote.JMXConnector;
 import javax.management.remote.JMXConnectorFactory;
 import javax.management.remote.JMXServiceURL;
+import javax.management.remote.rmi.RMIConnection;
+import javax.management.remote.rmi.RMIConnectionImpl_Stub;
 import javax.management.remote.rmi.RMIConnector;
 import javax.management.remote.rmi.RMIServer;
 import javax.management.remote.rmi.RMIServerImpl_Stub;
@@ -64,8 +67,14 @@ public class JmxConnectionInfo {
     @Parameter(names = {"--password"}, description="Password for JMX authentication (only for socket connection)")
     private String password = null;
 
+    @Parameter(names = {"--force-address"}, description="Override hostname:port for JMX RMI stub, default false")
+    private boolean forceAddress = false;
+
     @Parameter(names = {"--force-hostname"}, description="Override hostname for JMX RMI stub, default false")
     private boolean forceHostAddress = false;
+
+    @Parameter(names = {"--force-port"}, description="Override port for JMX RMI stub, default false")
+    private boolean forcePort = false;
 
     private boolean diagMode = false;
 
@@ -86,6 +95,12 @@ public class JmxConnectionInfo {
     }
 
     public MBeanServerConnection getMServer() {
+
+        if (forceAddress) {
+            forceHostAddress = true;
+            forcePort = true;
+        }
+
         if (pid == null && sockAddr == null) {
             commandHost.failAndPrintUsage("JVM process is not specified");
         }
@@ -156,10 +171,10 @@ public class JmxConnectionInfo {
                 if (diagMode) {
                     System.out.println("Try to connect via TLS");
                 }
-                Registry registry = LocateRegistry.getRegistry(host, port, new EnforcedSocketFactory(host, new SslRMIClientSocketFactory()));
+                Registry registry = LocateRegistry.getRegistry(host, port, new EnforcedSocketFactory(host, port, new SslRMIClientSocketFactory()));
                 try {
                     rmiServer = (RMIServer) registry.lookup("jmxrmi");
-                    rmiServer = overrideClientSocketFactory(host, rmiServer);
+                    rmiServer = overrideClientSocketFactory(host, port, rmiServer);
                 } catch (NotBoundException nbe) {
                     throw (IOException)
                             new IOException(nbe.getMessage()).initCause(nbe);
@@ -169,10 +184,10 @@ public class JmxConnectionInfo {
                     System.out.println("Failed to connect using TLS: " + e.toString());
                     System.out.println("Try to use plain socket");
                 }
-                Registry registry = LocateRegistry.getRegistry(host, port, new EnforcedSocketFactory(host, new DirectSocketFactory()));
+                Registry registry = LocateRegistry.getRegistry(host, port, new EnforcedSocketFactory(host, port, new DirectSocketFactory()));
                 try {
                     rmiServer = (RMIServer) registry.lookup("jmxrmi");
-                    rmiServer = overrideClientSocketFactory(host, rmiServer);
+                    rmiServer = overrideClientSocketFactory(host, port, rmiServer);
                 } catch (NotBoundException nbe) {
                     if (diagMode) {
                         System.out.println("Failed using LocateRegistry. Fallback to JMXConnectorFactory");
@@ -210,7 +225,7 @@ public class JmxConnectionInfo {
     }
 
     @SuppressWarnings("restriction")
-    private RMIServer overrideClientSocketFactory(String hostname, RMIServer rmiServer) {
+    private RMIServer overrideClientSocketFactory(String hostname, int port, RMIServer rmiServer) {
         try {
             if (rmiServer instanceof RemoteObject) {
                 RemoteRef ref = ((RemoteObject)rmiServer).getRef();
@@ -219,17 +234,58 @@ public class JmxConnectionInfo {
                 sun.rmi.transport.tcp.TCPEndpoint ep = (sun.rmi.transport.tcp.TCPEndpoint)(lref.getChannel().getEndpoint());
 
                 sun.rmi.transport.LiveRef nlref = new sun.rmi.transport.LiveRef(oid,
-                            new sun.rmi.transport.tcp.TCPEndpoint(ep.getHost(), ep.getPort(), new EnforcedSocketFactory(hostname, ep.getClientSocketFactory()), null),
+                            new sun.rmi.transport.tcp.TCPEndpoint(ep.getHost(), ep.getPort(), new EnforcedSocketFactory(hostname, port, ep.getClientSocketFactory()), null),
                             false);
 
-                return new RMIServerImpl_Stub(new sun.rmi.server.UnicastRef2(nlref));
+                return wrapWithSocketFactoryOverride(hostname, port, new RMIServerImpl_Stub(new sun.rmi.server.UnicastRef2(nlref)));
             }
         } catch (Exception e) {
             if (diagMode) {
                 System.out.println("Failed to inject socket factory into RMIServer stub: " + e.toString());
             }
         }
-        return rmiServer;
+        return wrapWithSocketFactoryOverride(hostname, port, rmiServer);
+    }
+
+    @SuppressWarnings("restriction")
+    private RMIConnection overrideClientSocketFactory(String hostname, int port, RMIConnection rmiConn) {
+        try {
+            if (rmiConn instanceof RemoteObject) {
+                RemoteRef ref = ((RemoteObject)rmiConn).getRef();
+                sun.rmi.transport.LiveRef lref = ((sun.rmi.server.UnicastRef)ref).getLiveRef();
+                ObjID oid = lref.getObjID();
+                sun.rmi.transport.tcp.TCPEndpoint ep = (sun.rmi.transport.tcp.TCPEndpoint)(lref.getChannel().getEndpoint());
+
+                sun.rmi.transport.LiveRef nlref = new sun.rmi.transport.LiveRef(oid,
+                        new sun.rmi.transport.tcp.TCPEndpoint(ep.getHost(), ep.getPort(), new EnforcedSocketFactory(hostname, port, ep.getClientSocketFactory()), null),
+                        false);
+
+                return new RMIConnectionImpl_Stub(new sun.rmi.server.UnicastRef2(nlref));
+            }
+        } catch (Exception e) {
+            if (diagMode) {
+                System.out.println("Failed to inject socket factory into RMIServer stub: " + e.toString());
+            }
+        }
+        return rmiConn;
+    }
+
+    private RMIServer wrapWithSocketFactoryOverride(final String hostname, final int port, final RMIServer delegate) {
+
+        return new RMIServer() {
+
+            @Override
+            public RMIConnection newClient(Object credentials) throws IOException {
+                RMIConnection conn = delegate.newClient(credentials);
+                conn = overrideClientSocketFactory(hostname, port, conn);
+                return conn;
+            }
+
+            @Override
+            public String getVersion() throws RemoteException {
+                return delegate.getVersion();
+            }
+        };
     }
 
     private String host(String sockAddr) {
@@ -257,22 +313,28 @@ public class JmxConnectionInfo {
 
         private final RMIClientSocketFactory delegate;
         private final String hostname;
+        private final int port;
 
-        public EnforcedSocketFactory(String hostname, RMIClientSocketFactory delegate) {
+        public EnforcedSocketFactory(String hostname, int port, RMIClientSocketFactory delegate) {
             this.delegate = delegate != null ? delegate : new DirectSocketFactory();
             this.hostname = hostname;
+            this.port = port;
         }
 
         @Override
         public Socket createSocket(String host, int port) throws IOException {
+            String origAddr = host + ":" + port;
+            String chost = forceHostAddress ? hostname : host;
+            int cport = forcePort ? this.port : port;
+            String connAddr = chost + ":" + cport;
             if (diagMode) {
-                if (forceHostAddress && !host.equals(hostname)) {
-                    System.out.println("Establishing connection to " + hostname + ":" + port + " (overriden from " + host + ")");
+                if (!origAddr.equals(connAddr)) {
+                    System.out.println("Establishing connection to " + chost + ":" + cport + " (overriden from " + origAddr + ")");
                 } else {
-                    System.out.println("Establishing connection to " + host + ":" + port);
+                    System.out.println("Establishing connection to " + chost + ":" + cport);
                 }
             }
-            return delegate.createSocket(forceHostAddress ? hostname : host, port);
+            return delegate.createSocket(chost, cport);
         }
 
         @Override

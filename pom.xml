@@ -28,7 +28,7 @@
 
   <groupId>org.gridkit.jvmtool</groupId>
   <artifactId>jvmtool-umbrella-pom</artifactId>
-  <version>0.22-SNAPSHOT</version>
+  <version>0.24-SNAPSHOT</version>
   <name>${project.groupId}::${project.artifactId}</name>
   <description>JVM tools, parent project</description>
   <packaging>pom</packaging>
